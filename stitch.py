@@ -2,123 +2,112 @@ import cv2
 import numpy as np
 import os
 
-print("Running Harris-Laplace + ORB + RANSAC + Blending pipeline...")
-
-# -----------------------------
-# Setup
-# -----------------------------
-image_dir = "images"
-output_dir = "output"
-os.makedirs(output_dir, exist_ok=True)
-
-files = sorted(os.listdir(image_dir))
-images = [cv2.imread(os.path.join(image_dir, f)) for f in files]
-assert all(img is not None for img in images)
-
-# -----------------------------
-# Stage 1: Harris-Laplace
-# -----------------------------
-def harris_laplace(img, max_pts=1200):
+def get_features(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    harris = cv2.cornerHarris(np.float32(gray), 2, 3, 0.04)
-    harris = cv2.dilate(harris, None)
+    # Harris-Laplace: Scale-invariant corner detection
+    detector = cv2.xfeatures2d.HarrisLaplaceFeatureDetector_create()
+    kp = detector.detect(gray)
+    # FREAK: Fast binary descriptor
+    descriptor = cv2.xfeatures2d.FREAK_create()
+    kp, des = descriptor.compute(img, kp)
+    return kp, des
 
-    coords = np.argwhere(harris > 0.01 * harris.max())
-    responses = harris[coords[:,0], coords[:,1]]
+def get_homography(img_src, img_dst):
+    kp1, des1 = get_features(img_src)
+    kp2, des2 = get_features(img_dst)
+    if des1 is None or des2 is None: return None
+    
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    raw_matches = matcher.knnMatch(des1, des2, k=2)
+    # Ratio Test to remove bad matches that cause 'starburst' warping
+    good = [m for m, n in raw_matches if m.distance < 0.7 * n.distance]
+    
+    if len(good) < 10: return None
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    # RANSAC for robust alignment
+    H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    return H
 
-    idx = np.argsort(responses)[-max_pts:]
-    keypoints = [cv2.KeyPoint(float(coords[i][1]), float(coords[i][0]), 16) for i in idx]
-    return gray, keypoints
+def stitch_3_ultra_seamless(im1_path, im2_path, im3_path):
+    img1 = cv2.imread(im1_path)
+    img2 = cv2.imread(im2_path)
+    img3 = cv2.imread(im3_path)
 
-# -----------------------------
-# Stage 2: ORB Descriptor
-# -----------------------------
-orb = cv2.ORB_create()
-keypoints = []
-descriptors = []
+    if any(x is None for x in [img1, img2, img3]):
+        return print("Error: Check image paths in your 'images' folder.")
 
-for i, img in enumerate(images):
-    gray, kp = harris_laplace(img)
-    kp, des = orb.compute(gray, kp)
-    if des is None:
-        kp, des = [], None
-    keypoints.append(kp)
-    descriptors.append(des)
-    vis = cv2.drawKeypoints(img, kp[:300], None, (0,255,0))
-    cv2.imwrite(f"{output_dir}/stage2_orb_{i}.jpg", vis)
+    print("Aligning images...")
+    H12 = get_homography(img1, img2)
+    H32 = get_homography(img3, img2)
+    if H12 is None or H32 is None: return print("Error: Alignment failed.")
 
-# -----------------------------
-# Stage 3: KNN + Ratio Test
-# -----------------------------
-bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-good_matches_all = []
+    # Canvas Setup
+    h, w = img2.shape[:2]
+    T = np.array([[1, 0, w], [0, 1, h//2], [0, 0, 1]], dtype=np.float32)
+    canvas_size = (w * 3, h * 2)
 
-for i in range(len(images)-1):
-    if descriptors[i] is None or descriptors[i+1] is None:
-        good_matches_all.append([])
-        continue
+    warp1 = cv2.warpPerspective(img1, T @ H12, canvas_size)
+    warp2 = cv2.warpPerspective(img2, T, canvas_size)
+    warp3 = cv2.warpPerspective(img3, T @ H32, canvas_size)
 
-    knn = bf.knnMatch(descriptors[i], descriptors[i+1], k=2)
-    good = []
-    for m, n in knn:
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
-    good_matches_all.append(good)
+    warped_images = [warp1, warp2, warp3]
+    
+    # Generate binary masks
+    def get_mask(iw):
+        gray = cv2.cvtColor(iw, cv2.COLOR_BGR2GRAY)
+        _, m = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+        # Erode mask edges to hide warping artifacts
+        return cv2.erode(m, np.ones((15, 15), np.uint8))
 
-    vis = cv2.drawMatches(images[i], keypoints[i], images[i+1], keypoints[i+1], good[:40], None)
-    cv2.imwrite(f"{output_dir}/stage3_matches_{i}.jpg", vis)
+    masks = [get_mask(w) for w in warped_images]
 
-# -----------------------------
-# Stage 4: RANSAC + Blending
-# -----------------------------
-panorama = images[0]
-H_total = np.eye(3)
+    # EXPOSURE COMPENSATION: Fixes brightness differences between photos
+    print("Compensating for exposure...")
+    compensator = cv2.detail.ExposureCompensator_createDefault(cv2.detail.ExposureCompensator_GAIN)
+    corners = [(0, 0), (0, 0), (0, 0)]
+    compensator.feed(corners, warped_images, masks)
+    for i in range(len(warped_images)):
+        compensator.apply(i, (0, 0), warped_images[i], masks[i])
 
-for i in range(len(good_matches_all)):
-    matches = good_matches_all[i]
-    if len(matches) < 8:
-        print(f"Skipping pair {i}-{i+1}")
-        continue
+    # MULTI-BAND BLENDING (Laplacian Pyramid)
+    print("Blending via Multi-band (Laplacian Pyramid)...")
+    
+    
+    # Try multiple initialization methods to handle different OpenCV versions
+    try:
+        blender = cv2.detail.MultiBandBlender()
+    except AttributeError:
+        try:
+            blender = cv2.detail_MultiBandBlender()
+        except AttributeError:
+            # For some versions, we use the create function
+            blender = cv2.detail.Blender_createDefault(cv2.detail.Blender_MULTI_BAND, False)
 
-    pts_prev = np.float32([keypoints[i][m.queryIdx].pt for m in matches]).reshape(-1,1,2)
-    pts_next = np.float32([keypoints[i+1][m.trainIdx].pt for m in matches]).reshape(-1,1,2)
+    blender.setNumBands(10) # 10 bands for super smooth color transitions
+    blender.prepare((0, 0, canvas_size[0], canvas_size[1]))
+    
+    for i in range(len(warped_images)):
+        # Blender requires 16-bit images to prevent overflow during calculations
+        blender.feed(warped_images[i].astype(np.int16), masks[i], (0, 0))
+    
+    result, result_mask = blender.blend(None, None)
+    final = np.clip(result, 0, 255).astype(np.uint8)
 
-    H, _ = cv2.findHomography(pts_next, pts_prev, cv2.RANSAC, 4.0)
-    if H is None:
-        continue
+    # Auto-Crop content
+    cnts, _ = cv2.findContours(result_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        x, y, cw, ch = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        final = final[y:y+ch, x:x+cw]
 
-    H_total = H_total @ H
+    # Save to directory
+    output_filename = "final_seamless_result.jpg"
+    cv2.imwrite(output_filename, final)
+    print(f"Success! Output saved as: {output_filename}")
+    
+    cv2.imshow("Ultra Seamless Result", cv2.resize(final, (1200, 600)))
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
-    h_p, w_p = panorama.shape[:2]
-    h_i, w_i = images[i+1].shape[:2]
-
-    warped = cv2.warpPerspective(images[i+1], H_total, (w_p + w_i, max(h_p, h_i)))
-
-    # Simple blending
-    mask_panorama = (panorama > 0).astype(np.float32)
-    mask_warped = (warped > 0).astype(np.float32)
-
-    blended = warped.copy()
-    overlap = np.logical_and(mask_panorama.any(axis=2), mask_warped.any(axis=2))
-    for c in range(3):
-        blended[:,:,c] = np.where(
-            overlap,
-            (warped[:,:,c].astype(np.float32) + panorama[:,:,c].astype(np.float32)) / 2,
-            blended[:,:,c]
-        )
-    blended[0:h_p, 0:w_p] = np.where(mask_panorama.astype(bool), panorama, blended[0:h_p, 0:w_p])
-
-    panorama = blended
-    cv2.imwrite(f"{output_dir}/stage4_stitch_{i}.jpg", panorama)
-
-# -----------------------------
-# Auto-crop black borders
-# -----------------------------
-gray = cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY)
-_, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-coords = cv2.findNonZero(thresh)
-x, y, w, h = cv2.boundingRect(coords)
-panorama = panorama[y:y+h, x:x+w]
-
-cv2.imwrite(f"{output_dir}/FINAL_PANORAMA.jpg", panorama)
-print("✅ Final panorama saved")
+# RUN THE PROCESS
+stitch_3_ultra_seamless('images/img1.JPG', 'images/img2.JPG', 'images/img3.JPG')
